@@ -14,6 +14,8 @@ import "core:sort"
 import "core:slice"
 import "core:unicode/utf8"
 import "core:reflect"
+import "core:runtime"
+import "core:intrinsics"
 
 import "shared:common"
 
@@ -3238,6 +3240,54 @@ get_globals :: proc(file: ast.File, ast_context: ^AstContext) {
 	}
 }
 
+DEFAULT_FLOAT_SIZE :: 64
+
+new_temp :: proc($T: typeid) -> ^T {
+	n, err := runtime.new(T, context.temp_allocator)
+	n.pos = {}
+	n.end = {}
+	n.derived = n
+	when intrinsics.type_has_field(T, "derived_expr") {
+		n.derived_expr = n
+	}
+	when intrinsics.type_has_field(T, "derived_stmt") {
+		n.derived_stmt = n
+	}
+	return n
+}
+
+get_equivalent_float_type :: proc(expr: ^ast.Expr, ast_context: ^AstContext) -> (^ast.Expr, bool) {
+	if type, ok := resolve_type_expression(ast_context, expr); ok {
+		name := type.name
+		log.info(type.name)
+		type_base: enum {
+			Quaternion,
+			Complex,
+		}
+
+		if strings.has_prefix(name, "quaternion") {
+			type_base = .Quaternion
+		} else if strings.has_prefix(name, "complex") {
+			type_base = .Complex
+		} else {
+			return nil, false
+		}
+
+		if size, ok := strconv.parse_int(name[len("quaternion") if type_base == .Quaternion else len("complex"):]); ok {
+			builder: strings.Builder
+			strings.builder_init(&builder, context.temp_allocator)
+			strings.write_string(&builder, "f")
+			strings.write_int(&builder, (size / 4) if type_base == .Quaternion else (size / 2))
+
+			type_expr := new_temp(ast.Ident);
+			type_expr.name = strings.clone(strings.to_string(builder))
+			return type_expr, true
+		}
+	}
+
+	return nil, false
+}
+
 get_generic_assignment :: proc(
 	file: ast.File,
 	value: ^ast.Expr,
@@ -3255,8 +3305,10 @@ get_generic_assignment :: proc(
 	case ^Call_Expr:
 		ast_context.call = cast(^ast.Call_Expr)value
 
+		found: bool
 		if symbol, ok := resolve_type_expression(ast_context, v.expr); ok {
 			if procedure, ok := symbol.value.(SymbolProcedureValue); ok {
+				found = true
 				for ret in procedure.return_types {
 					if ret.type != nil {
 						calls[len(results)] = true
@@ -3264,6 +3316,196 @@ get_generic_assignment :: proc(
 					} else if ret.default_value != nil {
 						calls[len(results)] = true
 						append(results, ret.default_value)
+					}
+				}
+			}
+		}
+
+		if !found {
+			if ident, ok := v.expr.derived.(^Ident); ok {
+				builtin_name := ident.name
+
+				switch builtin_name {
+				case "len": fallthrough
+				case "cap": fallthrough
+				case "size_of": fallthrough
+				case "align_of":
+					type_expr := new_temp(ast.Ident)
+					type_expr.name = "int"
+					append(results, type_expr)
+				case "offset_of_selector": fallthrough
+				case "offset_of_member": fallthrough
+				case "offset_of": fallthrough
+				case "offset_of_by_string":
+					type_expr := new_temp(ast.Ident)
+					type_expr.name = "uintptr"
+					append(results, type_expr)
+				case "type_of":
+					append(results, v.args[0])
+				case "type_info_of":
+					type_expr := ast.new(ast.Pointer_Type, {}, {})
+					selector_expr := ast.new(ast.Selector_Expr, {}, {})
+					package_expr := ast.new(ast.Ident, {}, {})
+					struct_ident := ast.new(ast.Ident, {}, {})
+
+					struct_ident.name = "Type_Info"
+					package_expr.name = "runtime"
+
+					selector_expr.field = struct_ident
+					selector_expr.expr = package_expr
+					type_expr.elem = selector_expr
+
+					append(results, type_expr)
+				case "typeid_of":
+					type_expr := new_temp(ast.Ident)
+					type_expr.name = "typeid"
+					append(results, type_expr)
+				case "swizzle":
+					type_expr := new_temp(ast.Array_Type)
+
+					arg := v.args[0]
+					if symbol, ok := resolve_type_expression(ast_context, arg); ok {
+						if array, ok := symbol.value.(SymbolFixedArrayValue); ok {
+							type_expr.elem = array.expr
+
+							builder: strings.Builder
+							strings.builder_init(&builder, context.temp_allocator)
+							strings.write_int(&builder, len(v.args) - 1)
+
+							len_expr := new_temp(ast.Basic_Lit)
+							len_expr.tok = tokenizer.Token { .Integer, strings.to_string(builder), {} }
+							type_expr.len = len_expr
+						}
+					}
+
+					append(results, type_expr)
+				case "complex":
+					if float_type, ok := resolve_type_expression(ast_context, v.args[0]); ok {
+						name := float_type.name
+						size: uint
+						ok: bool
+
+						if len(name) == 0 {
+							size = DEFAULT_FLOAT_SIZE
+						} else {
+							size, ok = strconv.parse_uint(name[len("f"):])
+							if !ok {
+								size = DEFAULT_FLOAT_SIZE
+							}
+						}
+
+						builder: strings.Builder
+						strings.builder_init(&builder, context.temp_allocator)
+						strings.write_string(&builder, "complex")
+						strings.write_uint(&builder, size * 2)
+
+						type_expr := new_temp(ast.Ident)
+						type_expr.name = strings.to_string(builder)
+						append(results, type_expr)
+					}
+				case "quaternion":
+					if float_type, ok := resolve_type_expression(ast_context, v.args[0]); ok {
+						name := float_type.name
+						size: uint
+						ok: bool
+
+						if len(name) == 0 {
+							size = DEFAULT_FLOAT_SIZE
+						} else {
+							size, ok = strconv.parse_uint(name[len("f"):])
+							if !ok {
+								size = DEFAULT_FLOAT_SIZE
+							}
+						}
+
+						builder: strings.Builder
+						strings.builder_init(&builder, context.temp_allocator)
+						strings.write_string(&builder, "quaternion")
+						strings.write_uint(&builder, size * 4)
+
+						type_expr := new_temp(ast.Ident)
+						type_expr.name = strings.to_string(builder)
+						append(results, type_expr)
+					}
+				case "real": fallthrough
+				case "imag": fallthrough
+				case "jmag": fallthrough
+				case "kmag":
+					if float_type, ok := get_equivalent_float_type(v.args[0], ast_context); ok {
+						append(results, float_type)
+					}
+				case "conj":
+					append(results, v.args[0])
+				case "expand_values":
+					value_expr := v.args[0]
+
+					if symbol, ok := resolve_type_expression(ast_context, value_expr); ok {
+						if struct_, ok := symbol.value.(SymbolStructValue); ok {
+							for item_type in struct_.types {
+								append(results, item_type)
+							}
+						} else if array, ok := symbol.value.(SymbolFixedArrayValue); ok {
+							value: uint
+							if basic_lit, ok := array.len.derived.(^Basic_Lit); ok {
+								if basic_lit.tok.kind == .Integer {
+									value, _ = strconv.parse_uint(basic_lit.tok.text)
+								}
+							}
+
+							for _ in 0..<value {
+								append(results, array.expr)
+							}
+						}
+					}
+				case "min": fallthrough
+				case "max": fallthrough
+				case "abs": fallthrough
+				case "clamp":
+					append(results, v.args[0])
+				case "soa_zip":
+					fields := make([dynamic]^ast.Field, context.temp_allocator)
+					names := make([dynamic]^ast.Expr, context.temp_allocator)
+
+					for arg in v.args {
+						name := arg.derived.(^Field_Value).field
+						if symbol, ok := resolve_type_expression(ast_context, arg.derived.(^Field_Value).value); ok {
+							if slice, ok := symbol.value.(SymbolSliceValue); ok {
+								field := runtime.new(ast.Field, context.temp_allocator)
+								append(&names, name)
+								field.names = names[len(names) - 1 : len(names)]
+								field.type = slice.expr
+								append(&fields, field)
+							}
+						}
+					}
+
+					type_expr := new_temp(ast.Array_Type)
+					struct_expr := new_temp(ast.Struct_Type)
+					soa_expr := new_temp(ast.Basic_Directive)
+
+					soa_expr.name = "soa"
+					type_expr.tag = soa_expr
+					type_expr.elem = struct_expr
+
+					struct_expr.fields = new_temp(ast.Field_List)
+					struct_expr.fields.list = fields[:]
+
+					append(results, type_expr)
+				case "soa_unzip":
+					arg := v.args[0]
+					if symbol, ok := resolve_type_expression(ast_context, arg); ok {
+						if slice, ok := symbol.value.(SymbolSliceValue); ok {
+							if symbol, ok := resolve_type_expression(ast_context, slice.expr); ok {
+								if struct_, ok := symbol.value.(SymbolStructValue); ok {
+									for item_type in struct_.types {
+										type_expr := new_temp(ast.Array_Type)
+										type_expr.elem = item_type
+
+										append(results, type_expr)
+									}
+								}
+							}
+						}
 					}
 				}
 			}
